@@ -1,0 +1,30 @@
+diff --git a/plugin/Civil3dMcpPlugin/PluginRuntime.cs b/plugin/Civil3dMcpPlugin/PluginRuntime.cs
+index d646ff9..4f469ca 100644
+--- a/plugin/Civil3dMcpPlugin/PluginRuntime.cs
++++ b/plugin/Civil3dMcpPlugin/PluginRuntime.cs
+@@ -31,7 +31,11 @@ public sealed class JsonRpcDispatchException : Exception
+ /// </summary>
+ public static class PluginRuntime
+ {
+-  public const int Port = 8080;
++  /// <summary>Listener port: CIVIL3D_PORT environment variable, default 8080.</summary>
++  public static readonly int Port =
++    int.TryParse(Environment.GetEnvironmentVariable("CIVIL3D_PORT"), out var port) && port is > 0 and < 65536
++      ? port
++      : 8080;
+ 
+   private static readonly object Sync = new();
+   private static RpcTcpServer? _server;
+diff --git a/src/tools/skillsTool.ts b/src/tools/skillsTool.ts
+index 53a8d33..476a8c3 100644
+--- a/src/tools/skillsTool.ts
++++ b/src/tools/skillsTool.ts
+@@ -37,7 +37,7 @@ interface SkillFile {
+ function parseSkillFile(filePath: string): SkillFile | null {
+   try {
+     const raw = fs.readFileSync(filePath, "utf-8");
+-    const frontmatterMatch = raw.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
++    const frontmatterMatch = raw.match(/^﻿?---\r?\n([\s\S]*?)\r?\n---\r?\n([\s\S]*)$/);
+ 
+     if (!frontmatterMatch) {
+       log.warn("Skill file missing frontmatter", { filePath });

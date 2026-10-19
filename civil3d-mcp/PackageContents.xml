@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ApplicationPackage SchemaVersion="1.0" AutodeskProduct="AutoCAD" ProductType="Application"
+  Name="Civil3dMcp" Description="Civil 3D MCP bridge (localhost JSON-RPC + Roslyn)" AppVersion="1.0.1"
+  Author="local" ProductCode="{5B0F7C2E-3D1A-4E8B-9C6F-2A7D4E1B8C30}" UpgradeCode="{9E4A1D6B-7C2F-4B3E-8A5D-1F6C9B2E7A41}">
+  <CompanyDetails Name="local" />
+  <RuntimeRequirements OS="Win64" Platform="Civil3D" SeriesMin="R25.0" SeriesMax="R25.9" />
+  <Components Description="Civil 3D MCP plugin">
+    <RuntimeRequirements OS="Win64" Platform="Civil3D" SeriesMin="R25.0" SeriesMax="R25.9" />
+    <ComponentEntry AppName="Civil3dMcp" ModuleName="./Contents/Civil3dMcpPlugin.dll"
+      AppDescription="Starts the MCP JSON-RPC listener on Civil 3D startup" LoadOnAutoCADStartup="True" />
+  </Components>
+</ApplicationPackage>

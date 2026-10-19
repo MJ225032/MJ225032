@@ -1,28 +1,26 @@
 ﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
-  barbosaihan/civil3d-mcp 원클릭 설치 (Windows + Civil 3D 2025 이상)
+  civil3d-mcp 사전 빌드 패키지 설치 (Windows + Civil 3D 2025/2026)
 
 .DESCRIPTION
-  1. 선행 조건 확인/설치 (git, Node 18+, .NET 8 SDK — 없으면 winget)
-  2. Civil 3D 설치 경로 자동 탐지 (2025+ / .NET 8 기반만 지원)
-  3. 검증된 커밋으로 clone (core.autocrlf=false → 스킬 파서 CRLF 버그 회피)
-  4. MCP 서버(Node) 빌드, 플러그인(C#) 빌드
-  5. Autoload 번들로 배포 → Civil 3D 시작 시 자동 로드 (매번 NETLOAD 불필요)
-  6. Claude Code / Claude Desktop 에 MCP 서버 등록
+  이 폴더에는 이미 빌드된 MCP 서버(server\)와 Civil 3D 플러그인 번들(Civil3dMcp.bundle\)이 들어 있습니다.
+  이 스크립트는 복사 + 등록만 합니다. 필요한 것은 Node.js 18+ 뿐 (없으면 winget 으로 설치).
+
+  1. server\            → %LOCALAPPDATA%\civil3d-mcp
+  2. Civil3dMcp.bundle\ → %APPDATA%\Autodesk\ApplicationPlugins  (Civil 3D 시작 시 자동 로드)
+  3. Claude Code / Claude Desktop 에 MCP 서버 등록
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File .\install.ps1
   powershell -ExecutionPolicy Bypass -File .\install.ps1 -Port 18080
-  powershell -ExecutionPolicy Bypass -File .\install.ps1 -Verify      # Civil 3D 켜고 도면 연 상태에서
+  powershell -ExecutionPolicy Bypass -File .\install.ps1 -Verify       # Civil 3D 켜고 도면 연 상태에서
   powershell -ExecutionPolicy Bypass -File .\install.ps1 -Uninstall
 #>
 [CmdletBinding()]
 param(
-  [string]$InstallDir = (Join-Path $env:USERPROFILE 'civil3d-mcp'),
-  [string]$Civil3DPath,                                         # 예: 'C:\Program Files\Autodesk\AutoCAD 2025'
-  [string]$Ref = '344ad15ff517a19232fdf4eda2685292bdf723cf',    # 검토한 커밋. 최신을 원하면 -Ref main
   [ValidateRange(1024, 65535)][int]$Port = 8080,
+  [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'civil3d-mcp'),
   [switch]$SkipClaudeCode,
   [switch]$SkipClaudeDesktop,
   [switch]$Verify,
@@ -30,16 +28,15 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$RepoUrl    = 'https://github.com/barbosaihan/civil3d-mcp.git'
+$Here       = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ServerName = 'civil3d'
 $BundleDir  = Join-Path $env:APPDATA 'Autodesk\ApplicationPlugins\Civil3dMcp.bundle'
-$RefDlls    = 'accoremgd.dll', 'AcDbMgd.dll', 'acmgd.dll', 'AecBaseMgd.dll', 'AeccDbMgd.dll'
+$Entry      = Join-Path $InstallDir 'build\index.js'
 
 function Step($msg) { Write-Host "`n==> $msg" -ForegroundColor Cyan }
 function Ok($msg)   { Write-Host "    [OK] $msg" -ForegroundColor Green }
 function Warn($msg) { Write-Host "    [!]  $msg" -ForegroundColor Yellow }
 
-# 네이티브 명령은 $ErrorActionPreference 로 안 잡히므로 exit code 를 직접 검사
 function Exec([scriptblock]$Block, [string]$What) {
   & $Block
   if ($LASTEXITCODE -ne 0) { throw "$What 실패 (exit $LASTEXITCODE)" }
@@ -51,45 +48,8 @@ function TryExec([scriptblock]$Block) {
   try { & $Block 2>&1 | Out-Null } catch { } finally { $ErrorActionPreference = $prev }
 }
 
-function Refresh-Path {
-  $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
-              [Environment]::GetEnvironmentVariable('Path', 'User')
-}
-
-function Ensure-Tool([string]$Cmd, [string]$WingetId, [scriptblock]$IsOk) {
-  $found = Get-Command $Cmd -ErrorAction SilentlyContinue
-  if ($found -and (& $IsOk)) { Ok "$Cmd 확인"; return }
-  if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
-    throw "$Cmd 이(가) 없거나 버전이 낮습니다. 수동 설치 후 다시 실행하세요 (winget id: $WingetId)."
-  }
-  Warn "$Cmd 설치/업그레이드 중 (winget $WingetId)"
-  Exec { winget install --id $WingetId -e --silent --accept-source-agreements --accept-package-agreements } "winget $WingetId"
-  Refresh-Path
-  if (-not ((Get-Command $Cmd -ErrorAction SilentlyContinue) -and (& $IsOk))) {
-    throw "$Cmd 설치 후에도 인식되지 않습니다. 새 PowerShell 창에서 다시 실행하세요."
-  }
-  Ok "$Cmd 설치됨"
-}
-
-function Find-Civil3D {
-  $roots = if ($Civil3DPath) { @(Get-Item -LiteralPath $Civil3DPath) } else {
-    Get-ChildItem (Join-Path $env:ProgramFiles 'Autodesk') -Directory -Filter 'AutoCAD 20*' -ErrorAction SilentlyContinue
-  }
-  $hits = foreach ($r in $roots) {
-    $aecc = Get-ChildItem -LiteralPath $r.FullName -Filter 'AeccDbMgd.dll' -Recurse -Depth 2 -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-    if (-not $aecc) { continue }
-    $year = if ($r.Name -match '(20\d\d)') { [int]$Matches[1] } else { 0 }
-    [pscustomobject]@{ Root = $r.FullName; Year = $year }
-  }
-  $hits = @($hits | Sort-Object Year -Descending)
-  if (-not $hits) { throw 'Civil 3D(AeccDbMgd.dll)를 찾지 못했습니다. -Civil3DPath "C:\Program Files\Autodesk\AutoCAD 20xx" 로 지정하세요.' }
-  if ($hits.Count -gt 1) { Warn ("여러 버전 발견: " + (($hits | ForEach-Object Year) -join ', ') + " → 최신 사용. 다른 버전은 -Civil3DPath 로 지정.") }
-  $pick = $hits[0]
-  if ($pick.Year -and $pick.Year -lt 2025) {
-    throw "Civil 3D $($pick.Year) 는 .NET Framework 기반이라 이 플러그인(net8.0-windows)을 로드할 수 없습니다. 2025 이상 필요."
-  }
-  return $pick
+function Assert-Civil3DClosed {
+  if (Get-Process acad -ErrorAction SilentlyContinue) { throw 'Civil 3D(acad.exe)가 실행 중입니다. 종료 후 다시 실행하세요 (플러그인 DLL 잠금).' }
 }
 
 function Get-DesktopConfigPaths {
@@ -122,7 +82,7 @@ function Test-Plugin {
   $client = New-Object Net.Sockets.TcpClient
   try {
     try { $client.Connect('127.0.0.1', $Port) } catch {
-      Warn "연결 실패. Civil 3D 가 실행 중인지, 명령줄에 'Civil3D MCP plugin initialized.' 가 떴는지 확인하세요 (C3DMCPSTATUS)."
+      Warn "연결 실패. Civil 3D 명령줄에 'Civil3D MCP plugin initialized.' 가 떴는지, C3DMCPSTATUS 결과가 running: True 인지 확인하세요."
       return $false
     }
     $stream = $client.GetStream(); $stream.ReadTimeout = 60000
@@ -131,18 +91,24 @@ function Test-Plugin {
     $resp = (New-Object IO.StreamReader($stream, [Text.Encoding]::UTF8)).ReadToEnd()   # 서버가 응답 후 연결을 닫음
     $json = $resp | ConvertFrom-Json
     if ($json.error) { Warn ("플러그인은 응답했지만 오류: " + ($json.error | ConvertTo-Json -Compress)); return $false }
-    Ok ("응답: " + ($json.result | ConvertTo-Json -Compress -Depth 5))
+    Ok ("Civil 3D 응답: " + ($json.result | ConvertTo-Json -Compress -Depth 5))
     return $true
   } finally { $client.Close() }
 }
 
 # ───────────────────────────── Verify / Uninstall ─────────────────────────────
-if ($Verify) { if (Test-Plugin) { exit 0 } else { exit 1 } }
+if ($Verify) {
+  $envPort = [Environment]::GetEnvironmentVariable('CIVIL3D_PORT', 'User')
+  if (-not $PSBoundParameters.ContainsKey('Port') -and $envPort) { $Port = [int]$envPort }
+  if (Test-Plugin) { exit 0 } else { exit 1 }
+}
 
 if ($Uninstall) {
   Step '제거'
-  if (Get-Process acad -ErrorAction SilentlyContinue) { throw 'Civil 3D 를 먼저 종료하세요 (DLL 잠금).' }
-  if (Test-Path $BundleDir) { Remove-Item $BundleDir -Recurse -Force; Ok "번들 삭제: $BundleDir" }
+  Assert-Civil3DClosed
+  if (Test-Path $BundleDir)  { Remove-Item $BundleDir -Recurse -Force; Ok "번들 삭제: $BundleDir" }
+  if (Test-Path $InstallDir) { Remove-Item $InstallDir -Recurse -Force; Ok "서버 삭제: $InstallDir" }
+  [Environment]::SetEnvironmentVariable('CIVIL3D_PORT', $null, 'User')
   if (Get-Command claude -ErrorAction SilentlyContinue) { TryExec { claude mcp remove $ServerName -s user }; Ok 'Claude Code 등록 해제' }
   foreach ($p in Get-DesktopConfigPaths) {
     if (-not (Test-Path $p)) { continue }
@@ -153,109 +119,71 @@ if ($Uninstall) {
       Write-JsonNoBom $p $cfg; Ok "Claude Desktop 등록 해제: $p"
     }
   }
-  Warn "소스 폴더는 남겨둠: $InstallDir (원하면 직접 삭제)"
   exit 0
 }
 
 # ───────────────────────────────── Install ─────────────────────────────────
-Step '선행 조건'
-Ensure-Tool git    'Git.Git'               { $true }
-Ensure-Tool node   'OpenJS.NodeJS.LTS'     { [int]((node --version) -replace '^v(\d+).*', '$1') -ge 18 }
-Ensure-Tool dotnet 'Microsoft.DotNet.SDK.8' { @(dotnet --list-sdks | Where-Object { $_ -match '^(\d+)\.' -and [int]$Matches[1] -ge 8 }).Count -gt 0 }
-$NodeExe = (Get-Command node).Source
+foreach ($need in 'server\build\index.js', 'server\node_modules', 'Civil3dMcp.bundle\PackageContents.xml', 'Civil3dMcp.bundle\Contents\Civil3dMcpPlugin.dll') {
+  if (-not (Test-Path (Join-Path $Here $need))) { throw "패키지가 불완전합니다: $need 없음. zip 을 통째로 압축 해제했는지 확인하세요." }
+}
 
-Step 'Civil 3D 탐지'
-$c3d = Find-Civil3D
-Ok "Civil 3D $($c3d.Year): $($c3d.Root)"
-if (Get-Process acad -ErrorAction SilentlyContinue) { throw 'Civil 3D 가 실행 중입니다. 종료 후 다시 실행하세요 (번들 DLL 덮어쓰기 불가).' }
+Step 'Node.js'
+$node = Get-Command node -ErrorAction SilentlyContinue
+$nodeOk = $node -and ([int]((& node --version) -replace '^v(\d+).*', '$1') -ge 18)
+if (-not $nodeOk) {
+  if (-not (Get-Command winget -ErrorAction SilentlyContinue)) { throw 'Node.js 18+ 가 필요합니다. https://nodejs.org 에서 LTS 설치 후 다시 실행하세요.' }
+  Warn 'Node.js LTS 설치 중 (winget)'
+  Exec { winget install --id OpenJS.NodeJS.LTS -e --silent --accept-source-agreements --accept-package-agreements } 'winget Node.js'
+  $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
+  $node = Get-Command node -ErrorAction SilentlyContinue
+  if (-not $node) { throw 'Node.js 설치 후에도 인식되지 않습니다. 새 PowerShell 창에서 다시 실행하세요.' }
+}
+$NodeExe = $node.Source
+Ok "$NodeExe ($(& node --version))"
+
+Step 'Civil 3D 확인'
+$c3d = Get-ChildItem (Join-Path $env:ProgramFiles 'Autodesk') -Directory -Filter 'AutoCAD 20*' -ErrorAction SilentlyContinue |
+  Where-Object { Get-ChildItem -LiteralPath $_.FullName -Filter 'AeccDbMgd.dll' -Recurse -Depth 2 -ErrorAction SilentlyContinue | Select-Object -First 1 } |
+  ForEach-Object { if ($_.Name -match '(20\d\d)') { [int]$Matches[1] } } | Sort-Object -Descending
+if (-not $c3d) { Warn 'Civil 3D 설치 경로를 찾지 못했습니다 (비표준 경로면 무시해도 됨).' }
+else {
+  Ok ("발견: Civil 3D " + ($c3d -join ', '))
+  if (-not ($c3d | Where-Object { $_ -in 2025, 2026 })) {
+    Warn "이 패키지는 Civil 3D 2025/2026(.NET 8, R25.x)용으로 빌드됐습니다. $($c3d -join ', ') 에서는 자동 로드되지 않습니다."
+  }
+}
+Assert-Civil3DClosed
 
 $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($listener) {
   $owner = (Get-Process -Id $listener.OwningProcess -ErrorAction SilentlyContinue).ProcessName
-  Warn "포트 $Port 를 이미 '$owner' 가 사용 중 → 플러그인이 바인딩 실패합니다. -Port 18080 같은 값으로 다시 실행 권장."
+  Warn "포트 $Port 를 '$owner' 가 이미 사용 중 → 플러그인이 바인딩 실패합니다. -Port 18080 처럼 다른 값으로 다시 실행하세요."
 }
 
-Step "소스 받기 → $InstallDir  (ref $Ref)"
-if (Test-Path (Join-Path $InstallDir '.git')) {
-  Exec { git -C $InstallDir fetch --quiet origin } 'git fetch'
-} else {
-  Exec { git -c core.autocrlf=false clone --quiet $RepoUrl $InstallDir } 'git clone'
-}
-Exec { git -C $InstallDir config core.autocrlf false } 'git config'
-Exec { git -C $InstallDir checkout --quiet --force $Ref } 'git checkout'
-# 기존 clone 이 CRLF 로 체크아웃돼 있었다면 LF 로 재정규화
-TryExec { git -C $InstallDir rm --cached -r -q . }
-Exec { git -C $InstallDir reset --quiet --hard } 'git reset'
-
-$skill = Get-ChildItem (Join-Path $InstallDir 'skills') -Filter '*.skill.md' -Recurse | Select-Object -First 1
-if ($skill -and ([IO.File]::ReadAllText($skill.FullName) -match "`r`n")) {
-  Warn '스킬 파일이 여전히 CRLF 입니다 → civil3d_skills 가 0개를 반환합니다. 전역 git 설정(core.autocrlf / .gitattributes)을 확인하세요.'
-} else { Ok '스킬 파일 LF 확인' }
-
-if ($Port -ne 8080) {
-  $rt = Join-Path $InstallDir 'plugin\Civil3dMcpPlugin\PluginRuntime.cs'
-  $src = [IO.File]::ReadAllText($rt)
-  if ($src -notmatch 'public const int Port = 8080;') { throw "PluginRuntime.cs 에서 포트 상수를 찾지 못했습니다 (업스트림 변경). -Ref 를 확인하세요." }
-  [IO.File]::WriteAllText($rt, ($src -replace 'public const int Port = 8080;', "public const int Port = $Port;"), (New-Object Text.UTF8Encoding $false))
-  Ok "플러그인 포트 → $Port"
-}
-
-Step 'Autodesk 참조 DLL 복사 → C_References'
-$refDir = Join-Path $InstallDir 'C_References'
-foreach ($dll in $RefDlls) {
-  $f = Get-ChildItem -LiteralPath $c3d.Root -Filter $dll -Recurse -Depth 2 -ErrorAction SilentlyContinue |
-       Sort-Object { $_.FullName.Length } | Select-Object -First 1
-  if (-not $f) { throw "$dll 을(를) $($c3d.Root) 에서 찾지 못했습니다." }
-  Copy-Item $f.FullName $refDir -Force
-  Ok "$dll  ←  $($f.DirectoryName)"
-}
-
-Step 'MCP 서버 빌드 (Node)'
-Push-Location $InstallDir
-try {
-  Exec { npm ci --no-audit --no-fund --loglevel=error } 'npm ci'
-  Exec { npm run build --silent } 'npm run build'
-} finally { Pop-Location }
-$Entry = Join-Path $InstallDir 'build\index.js'
-if (-not (Test-Path $Entry)) { throw "빌드 산출물 없음: $Entry" }
+Step "MCP 서버 복사 → $InstallDir"
+if (Test-Path $InstallDir) { Remove-Item $InstallDir -Recurse -Force }
+Copy-Item (Join-Path $Here 'server') $InstallDir -Recurse -Force
 Ok $Entry
 
-Step '플러그인 빌드 (.NET 8)'
-$proj = Join-Path $InstallDir 'plugin\Civil3dMcpPlugin\Civil3dMcpPlugin.csproj'
-$out  = Join-Path $InstallDir 'plugin\out'
-if (Test-Path $out) { Remove-Item $out -Recurse -Force }
-Exec { dotnet build $proj -c Release -o $out --nologo -v quiet "-p:Civil3DReferencesPath=$refDir" } 'dotnet build'
-Ok (Join-Path $out 'Civil3dMcpPlugin.dll')
-
-Step "Autoload 번들 배포 → $BundleDir"
+Step "플러그인 번들 복사 → $BundleDir"
 if (Test-Path $BundleDir) { Remove-Item $BundleDir -Recurse -Force }
-$contents = Join-Path $BundleDir 'Contents'
-New-Item $contents -ItemType Directory -Force | Out-Null
-Copy-Item (Join-Path $out '*') $contents -Recurse -Force
-# Autodesk DLL 은 Civil 3D 가 이미 로드하므로 번들에 넣지 않음 (Private=False 지만 방어적으로 제거)
-$RefDlls | ForEach-Object { Remove-Item (Join-Path $contents $_) -ErrorAction SilentlyContinue }
-@'
-<?xml version="1.0" encoding="utf-8"?>
-<ApplicationPackage SchemaVersion="1.0" AutodeskProduct="AutoCAD" ProductType="Application"
-  Name="Civil3dMcp" Description="Civil 3D MCP bridge (localhost JSON-RPC + Roslyn)" AppVersion="1.0.0"
-  Author="local" ProductCode="{5B0F7C2E-3D1A-4E8B-9C6F-2A7D4E1B8C30}" UpgradeCode="{9E4A1D6B-7C2F-4B3E-8A5D-1F6C9B2E7A41}">
-  <CompanyDetails Name="local" />
-  <RuntimeRequirements OS="Win64" Platform="Civil3D" SeriesMin="R25.0" />
-  <Components Description="Civil 3D MCP plugin">
-    <RuntimeRequirements OS="Win64" Platform="Civil3D" SeriesMin="R25.0" />
-    <ComponentEntry AppName="Civil3dMcp" ModuleName="./Contents/Civil3dMcpPlugin.dll"
-      AppDescription="Starts the MCP JSON-RPC listener on Civil 3D startup" LoadOnAutoCADStartup="True" />
-  </Components>
-</ApplicationPackage>
-'@ | Set-Content -LiteralPath (Join-Path $BundleDir 'PackageContents.xml') -Encoding UTF8
+New-Item (Split-Path $BundleDir) -ItemType Directory -Force | Out-Null
+Copy-Item (Join-Path $Here 'Civil3dMcp.bundle') $BundleDir -Recurse -Force
+# 인터넷에서 받은 zip 의 DLL 은 Zone.Identifier(MOTW) 가 붙어 .NET 로드가 막힐 수 있음
+Get-ChildItem $BundleDir, $InstallDir -Recurse -File | Unblock-File
 Ok '번들 배포 완료 (Civil 3D 시작 시 자동 로드)'
+
+# 플러그인은 acad.exe 의 환경변수 CIVIL3D_PORT 를 읽음 (없으면 8080)
+if ($Port -ne 8080) { [Environment]::SetEnvironmentVariable('CIVIL3D_PORT', "$Port", 'User'); Ok "사용자 환경변수 CIVIL3D_PORT=$Port" }
+else { [Environment]::SetEnvironmentVariable('CIVIL3D_PORT', $null, 'User') }
 
 if (-not $SkipClaudeCode) {
   Step 'Claude Code 등록'
   if (Get-Command claude -ErrorAction SilentlyContinue) {
     TryExec { claude mcp remove $ServerName -s user }
-    Exec { claude mcp add $ServerName -s user -e "CIVIL3D_PORT=$Port" -- $NodeExe $Entry } 'claude mcp add'
-    Ok "user 스코프에 '$ServerName' 등록 (claude mcp list 로 확인)"
+    # 127.0.0.1 명시: Windows 에서 localhost 는 ::1 로 먼저 풀리는데 플러그인은 IPv4 루프백에만 바인딩
+    Exec { claude mcp add $ServerName -s user -e CIVIL3D_HOST=127.0.0.1 -e "CIVIL3D_PORT=$Port" -- $NodeExe $Entry } 'claude mcp add'
+    Ok "user 스코프에 '$ServerName' 등록 (확인: claude mcp list)"
   } else { Warn 'claude CLI 없음 → 건너뜀' }
 }
 
@@ -269,18 +197,23 @@ if (-not $SkipClaudeDesktop) {
     if (-not ($cfg.PSObject.Properties.Name -contains 'mcpServers')) {
       $cfg | Add-Member -NotePropertyName mcpServers -NotePropertyValue ([pscustomobject]@{})
     }
-    $server = [pscustomobject]@{ command = $NodeExe; args = @($Entry); env = [pscustomobject]@{ CIVIL3D_PORT = "$Port" } }
+    $server = [pscustomobject]@{
+      command = $NodeExe
+      args    = @($Entry)
+      env     = [pscustomobject]@{ CIVIL3D_HOST = '127.0.0.1'; CIVIL3D_PORT = "$Port" }
+    }
     $cfg.mcpServers | Add-Member -NotePropertyName $ServerName -NotePropertyValue $server -Force
     Write-JsonNoBom $p $cfg
-    Ok "$p  (백업: .bak) — Claude Desktop 재시작 필요"
+    Ok "$p  (백업: .bak) — Claude Desktop 완전 종료 후 재시작"
   }
 }
 
 Step '완료'
 Write-Host @"
-    1) Civil 3D 실행 → 도면 열기. 명령줄에 'Civil3D MCP plugin initialized.' 확인
-       (안 뜨면: NETLOAD → $contents\Civil3dMcpPlugin.dll)
-    2) 연결 테스트:  powershell -ExecutionPolicy Bypass -File "$PSCommandPath" -Verify$(if ($Port -ne 8080) { " -Port $Port" })
+    1) Civil 3D 실행 → 도면 열기 → 명령줄에 'Civil3D MCP plugin initialized.' 확인
+       안 뜨면: NETLOAD → $BundleDir\Contents\Civil3dMcpPlugin.dll
+       '보안 - 로드되지 않은 실행 파일' 경고가 뜨면 [항상 로드]
+    2) 연결 테스트:  powershell -ExecutionPolicy Bypass -File "$PSCommandPath" -Verify
     3) Claude 에서:  "civil3d_skills 로 스킬 목록 보여주고, 도면의 서피스 나열해줘"
     ⚠ civil3d_execute 는 도면을 수정합니다. 작업 전 저장, 사본 도면에서 먼저 검증하세요.
 "@
