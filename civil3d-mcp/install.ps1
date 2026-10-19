@@ -182,7 +182,9 @@ if (-not $SkipClaudeCode) {
   if (Get-Command claude -ErrorAction SilentlyContinue) {
     TryExec { claude mcp remove $ServerName -s user }
     # 127.0.0.1 명시: Windows 에서 localhost 는 ::1 로 먼저 풀리는데 플러그인은 IPv4 루프백에만 바인딩
-    Exec { claude mcp add $ServerName -s user -e CIVIL3D_HOST=127.0.0.1 -e "CIVIL3D_PORT=$Port" -- $NodeExe $Entry } 'claude mcp add'
+    # '--' 는 반드시 따옴표: PowerShell 은 맨 -- 를 자기 인자 종료 토큰으로 삼켜서 claude.ps1 shim 에 전달하지 않음
+    # → 가변 인자 -e 가 node 경로까지 먹어 'missing required argument commandOrUrl' 발생
+    Exec { claude mcp add $ServerName -s user -e CIVIL3D_HOST=127.0.0.1 -e "CIVIL3D_PORT=$Port" '--' $NodeExe $Entry } 'claude mcp add'
     Ok "user 스코프에 '$ServerName' 등록 (확인: claude mcp list)"
   } else { Warn 'claude CLI 없음 → 건너뜀' }
 }
